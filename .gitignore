@@ -33,21 +33,21 @@ env/
 .ipynb_checkpoints
 
 # Data files (large datasets)
-data/*.csv
-data/*.pkl
-data/*.npy
-!data/.gitkeep
-
+# data/*.csv
+# data/*.pkl
+# data/*.npy
+# !data/.gitkeep
+data/
 # Model checkpoints
-models/*.pt
-models/*.pth
-!models/.gitkeep
-
+# models/*.pt
+# models/*.pth
+# !models/.gitkeep
+models/
 # Output files
-outputs/*.png
-outputs/*.json
-!outputs/.gitkeep
-
+# outputs/*.png
+# outputs/*.json
+# !outputs/.gitkeep
+outputs/
 # IDE
 .vscode/
 .idea/
