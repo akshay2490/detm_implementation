@@ -217,10 +217,15 @@ class DETMTrainer:
             bow = batch["bow"].to(self.device)
             t_idx = batch["time_idx"].to(self.device)
             out = self.model(bow, t_idx, compute_loss=True)
-            for k in totals:
-                totals[k] += out[{"loss": "loss", "recon": "recon_loss",
-                                   "kl_theta": "kl_theta", "kl_eta": "kl_eta",
-                                   "kl_alpha": "kl_alpha"}[k]].item()
+            # Unscaled loss — no KL annealing / weighting during validation
+            # so the metric reflects the true ELBO components.
+            totals["recon"] += out["recon_loss"].item()
+            totals["kl_theta"] += out["kl_theta"].item()
+            totals["kl_eta"] += out["kl_eta"].item()
+            totals["kl_alpha"] += out["kl_alpha"].item()
+            totals["loss"] += (
+                out["recon_loss"] + out["kl_theta"] + out["kl_eta"] + out["kl_alpha"]
+            ).item()
             n += 1
 
         return {f"val_{k}": v / n for k, v in totals.items()}

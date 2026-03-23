@@ -19,6 +19,7 @@ Importing
 
 from __future__ import annotations
 
+import math
 from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
@@ -242,12 +243,19 @@ class TemporalBaselineEncoder(nn.Module):
             eta_t = self.reparameterize(mu_t, logvar_t)
 
             var_t = logvar_t.exp()
-            kl_t = 0.5 * torch.sum(
-                var_t / self.delta_sq
-                + (mu_t - eta_prev).pow(2) / self.delta_sq
-                - 1.0
-                - torch.log(var_t / self.delta_sq)
-            )
+            if t == 0:
+                # Prior is N(0, I) — variance 1.0, not delta_sq
+                kl_t = 0.5 * torch.sum(
+                    var_t + mu_t.pow(2) - 1.0 - logvar_t
+                )
+            else:
+                # Prior is N(eta_{t-1}, delta_sq·I)
+                kl_t = 0.5 * torch.sum(
+                    var_t / self.delta_sq
+                    + (mu_t - eta_prev).pow(2) / self.delta_sq
+                    - 1.0
+                    - logvar_t + math.log(self.delta_sq)
+                )
             kl_terms.append(kl_t)
             eta_prev = eta_t
             eta_list.append(eta_t)
@@ -398,35 +406,44 @@ class DETM(nn.Module):
     # Alpha KL
     # ------------------------------------------------------------------
 
+    def _reparameterize_alpha(self, mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
+        if self.training:
+            return mu + torch.exp(0.5 * logvar) * torch.randn_like(mu)
+        return mu
+
     def _compute_alpha_kl(self) -> torch.Tensor:
         """
         KL(q(α) || p(α)) summed over all T × K × L elements.
 
-        Handles the expectation over the random prior mean α_{t-1} by adding
-        var_{t-1}/γ² — the term missing from the reference implementation.
+        t=0 : prior is N(0, I)  — standard normal (variance 1.0, not gamma_sq)
+        t>0 : prior is N(α_{t-1}, γ²·I) — tight random walk
+                α_{t-1} is a MC sample so gradients flow correctly.
         Caller divides by num_train_docs to normalise to per-document scale.
         """
         gamma_sq = self.config.ALPHA_PRIOR_VARIANCE
-        kl = 0.0
+        total_kl = 0.0
 
+        # t=0: KL(N(mu_0, var_0) || N(0, I))
         mu_0 = self.alpha_mu[0]
         var_0 = self.alpha_logvar[0].exp()
-        kl += 0.5 * torch.sum(
-            var_0 / gamma_sq + mu_0.pow(2) / gamma_sq - 1.0 - torch.log(var_0 / gamma_sq)
+        total_kl += 0.5 * torch.sum(
+            var_0 + mu_0.pow(2) - 1.0 - self.alpha_logvar[0]
         )
 
+        # t>0: KL(N(mu_t, var_t) || N(alpha_{t-1}, gamma_sq·I))
+        alpha_prev = self._reparameterize_alpha(self.alpha_mu[0], self.alpha_logvar[0])
         for t in range(1, self.num_time_steps):
             mu_t = self.alpha_mu[t]
             var_t = self.alpha_logvar[t].exp()
-            mu_p = self.alpha_mu[t - 1]
-            var_p = self.alpha_logvar[t - 1].exp()
-            kl += 0.5 * torch.sum(
+            total_kl += 0.5 * torch.sum(
                 var_t / gamma_sq
-                + ((mu_t - mu_p).pow(2) + var_p) / gamma_sq
+                + (mu_t - alpha_prev).pow(2) / gamma_sq
                 - 1.0
-                - torch.log(var_t / gamma_sq)
+                - self.alpha_logvar[t] + math.log(gamma_sq)
             )
-        return kl
+            alpha_prev = self._reparameterize_alpha(mu_t, self.alpha_logvar[t])
+
+        return total_kl
 
     # ------------------------------------------------------------------
     # Forward
