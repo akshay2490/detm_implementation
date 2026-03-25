@@ -5,7 +5,7 @@ Training infrastructure for the Dynamic Embedded Topic Model.
 
 Public API
 ----------
-    DETMTrainer — manages the full train/validate/checkpoint/early-stop loop
+    DETMTrainer — manages the full train/validate/checkpoint loop
 
 Usage
 -----
@@ -37,20 +37,20 @@ class DETMTrainer:
 
     Features
     --------
-    - Adam optimiser with constant LR and L2 weight decay (matches Dieng et al. 2019)
-    - Gradient clipping
-    - TensorBoard logging (batch and epoch metrics); each run gets a timestamped subdir
-    - Periodic checkpointing + best-model checkpoint
-    - Early stopping on validation loss
+    - Adam optimiser with plateau-based LR annealing (÷4) and L2 weight decay
+    - NaN/Inf batch skipping to prevent model corruption
+    - Gradient clipping (disabled when ``config.CLIP_GRAD == 0``)
+    - TensorBoard logging (batch loss/components/grad-norm; epoch metrics; alpha diagnostics)
+    - Periodic checkpointing + best-model checkpoint (by validation loss)
 
     Parameters
     ----------
-    model        : DETM instance (will be moved to ``device``)
+    model        : DETM instance
     config       : DETMConfig
     train_loader : training DataLoader
     val_loader   : validation DataLoader
     device       : torch.device
-    log_dir      : override TensorBoard log directory (default: auto-timestamped)
+    log_dir      : override TensorBoard log directory (auto-timestamped by default)
     """
 
     def __init__(
@@ -61,7 +61,7 @@ class DETMTrainer:
         val_loader: DataLoader,
         device: torch.device,
         log_dir: Optional[str] = None,
-    ):
+    ) -> None:
         self.model = model.to(device)
         self.config = config
         self.train_loader = train_loader
@@ -76,7 +76,7 @@ class DETMTrainer:
         print(f"TensorBoard: {log_dir}")
         print(f"  → tensorboard --logdir={config.OUTPUTS_DIR / 'tensorboard_logs'}")
 
-        # Adam with L2 weight-decay — NOT AdamW (decoupled decay differs from the paper)
+        # Adam with L2 weight-decay
         self.optimizer = Adam(
             model.parameters(),
             lr=config.LEARNING_RATE,
@@ -85,7 +85,7 @@ class DETMTrainer:
 
         self.global_step = 0
         self.best_val_loss = float("inf")
-        self.patience_counter = 0
+        self.plateau_counter = 0
         self.history: Dict[str, list] = {
             "train_loss": [], "train_recon": [],
             "train_kl_theta": [], "train_kl_eta": [], "train_kl_alpha": [],
@@ -98,37 +98,52 @@ class DETMTrainer:
     # Public
     # ------------------------------------------------------------------
 
-    def train(self, num_epochs: Optional[int] = None) -> Dict[str, list]:
+    def train(
+        self,
+        num_epochs: Optional[int] = None,
+        start_epoch: int = 0,
+    ) -> Dict[str, list]:
         """
         Run the full training loop.
 
         Parameters
         ----------
-        num_epochs : override config.NUM_EPOCHS
+        num_epochs  : override config.NUM_EPOCHS (None = use config)
+        start_epoch : last completed epoch when resuming from checkpoint
 
         Returns
         -------
-        history dict (same as self.history)
+        history dict (same reference as self.history)
         """
         epochs = num_epochs or self.config.NUM_EPOCHS
-        lr = self.config.LEARNING_RATE
+        lr = self.optimizer.param_groups[0]["lr"]
 
         print("\n" + "=" * 60)
         print("TRAINING DETM")
         print("=" * 60)
-        print(f"  Epochs      : {epochs}")
-        print(f"  LR          : {lr}  (constant)")
-        print(f"  Weight decay: {self.config.WEIGHT_DECAY}")
-        print(f"  Grad clip   : {self.config.CLIP_GRAD}")
-        print(f"  Device      : {self.device}")
-        print(f"  Patience    : {self.config.PATIENCE}")
+        print(f"  Epochs       : {epochs}")
+        print(f"  Start epoch  : {start_epoch + 1}")
+        print(f"  LR           : {lr}")
+        print(f"  Weight decay : {self.config.WEIGHT_DECAY}")
+        print(f"  Grad clip    : {self.config.CLIP_GRAD} "
+              f"({'disabled' if self.config.CLIP_GRAD == 0 else 'enabled'})")
+        print(f"  Device       : {self.device}")
+        print(f"  Anneal every : {self.config.LR_ANNEAL_PATIENCE} plateau epoch(s)")
+        if start_epoch > 0:
+            print(f"  Resuming from completed epoch : {start_epoch}")
+            print(f"  Best val_loss so far          : {self.best_val_loss:.4f}")
+            print(f"  Plateau counter               : {self.plateau_counter}")
         print("=" * 60)
 
-        for epoch in range(1, epochs + 1):
+        if start_epoch >= epochs:
+            self.writer.close()
+            print("No training run: checkpoint already reached the requested epoch count.")
+            return self.history
+
+        for epoch in range(start_epoch + 1, epochs + 1):
             train_m = self._train_epoch()
             val_m = self._validate()
 
-            # History
             self.history["train_loss"].append(train_m["train_loss"])
             self.history["train_recon"].append(train_m["train_recon"])
             self.history["train_kl_theta"].append(train_m["train_kl_theta"])
@@ -141,38 +156,43 @@ class DETMTrainer:
             self.history["val_kl_alpha"].append(val_m["val_kl_alpha"])
             self.history["learning_rate"].append(lr)
 
-            # TensorBoard
             self._log_epoch(epoch, train_m, val_m, lr)
 
-            # Console summary
             print(
                 f"\nEpoch {epoch}/{epochs} — "
-                f"train={train_m['train_loss']:.4f} "
-                f"(recon={train_m['train_recon']:.4f}, "
-                f"KL_θ={train_m['train_kl_theta']:.4f}, "
-                f"KL_η={train_m['train_kl_eta']:.4f}, "
-                f"KL_α={train_m['train_kl_alpha']:.4f})  |  "
-                f"val={val_m['val_loss']:.4f}"
+                f"train={train_m['train_loss']:.4e} "
+                f"(recon={train_m['train_recon']:.4e}, "
+                f"KL_θ={train_m['train_kl_theta']:.4e}, "
+                f"KL_η={train_m['train_kl_eta']:.4e}, "
+                f"KL_α={train_m['train_kl_alpha']:.4e})  |  "
+                f"val={val_m['val_loss']:.4e}"
             )
 
-            # Checkpoint / early stop
             is_best = val_m["val_loss"] < self.best_val_loss
             if is_best:
                 self.best_val_loss = val_m["val_loss"]
-                self.patience_counter = 0
-                print(f"  ✓ New best val_loss: {self.best_val_loss:.4f}")
+                self.plateau_counter = 0
+                print(f"  ✓ New best val_loss: {self.best_val_loss:.4e}")
             else:
-                self.patience_counter += 1
-                print(f"  No improvement ({self.patience_counter}/{self.config.PATIENCE})")
+                self.plateau_counter += 1
+                print(
+                    f"  No improvement ({self.plateau_counter}/"
+                    f"{self.config.LR_ANNEAL_PATIENCE})"
+                )
+                if self.plateau_counter % self.config.LR_ANNEAL_PATIENCE == 0:
+                    for pg in self.optimizer.param_groups:
+                        pg["lr"] /= 4.0
+                    lr = self.optimizer.param_groups[0]["lr"]
+                    print(f"  LR annealed → {lr:.2e}")
 
             self._save_checkpoint(epoch, is_best)
 
-            if self.patience_counter >= self.config.PATIENCE:
-                print(f"\nEarly stopping at epoch {epoch}.")
-                break
-
         self.writer.close()
-        print(f"\n{'='*60}\nTraining complete. Best val_loss: {self.best_val_loss:.4f}\n{'='*60}")
+        print(
+            f"\n{'='*60}\n"
+            f"Training complete. Best val_loss: {self.best_val_loss:.4e}\n"
+            f"{'='*60}"
+        )
         return self.history
 
     # ------------------------------------------------------------------
@@ -182,30 +202,69 @@ class DETMTrainer:
     def _train_epoch(self) -> Dict[str, float]:
         self.model.train()
         totals = {k: 0.0 for k in ("loss", "recon", "kl_theta", "kl_eta", "kl_alpha")}
-        n = 0
+        n_ok = 0
+        n_nan = 0
 
-        for batch in tqdm(self.train_loader, desc="Train", leave=False):
+        key_map = {
+            "loss": "loss", "recon": "recon_loss",
+            "kl_theta": "kl_theta", "kl_eta": "kl_eta", "kl_alpha": "kl_alpha",
+        }
+
+        pbar = tqdm(self.train_loader, desc="Train", leave=False)
+        for batch in pbar:
             bow = batch["bow"].to(self.device)
             t_idx = batch["time_idx"].to(self.device)
 
             out = self.model(bow, t_idx, compute_loss=True)
+            loss = out["loss"]
+
+            # ── NaN/Inf guard ─────────────────────────────────────────────────
+            if not torch.isfinite(loss):
+                n_nan += 1
+                self.optimizer.zero_grad()
+                if n_nan <= 3:
+                    print(f"\n  ⚠ NaN/Inf loss in batch — skipping (total: {n_nan})")
+                self.global_step += 1
+                continue
 
             self.optimizer.zero_grad()
-            out["loss"].backward()
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.CLIP_GRAD)
+            loss.backward()
+
+            # Gradient clipping (or just norm-logging when 0 = disabled)
+            clip = self.config.CLIP_GRAD if self.config.CLIP_GRAD > 0 else float("inf")
+            grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), clip)
+
+            if not torch.isfinite(grad_norm):
+                n_nan += 1
+                self.optimizer.zero_grad()
+                if n_nan <= 3:
+                    print(f"\n  ⚠ NaN gradient norm — skipping update (total: {n_nan})")
+                self.global_step += 1
+                continue
+
             self.optimizer.step()
 
-            for k in totals:
-                totals[k] += out[{"loss": "loss", "recon": "recon_loss",
-                                   "kl_theta": "kl_theta", "kl_eta": "kl_eta",
-                                   "kl_alpha": "kl_alpha"}[k]].item()
+            for k, out_k in key_map.items():
+                totals[k] += out[out_k].item()
+            n_ok += 1
 
             if self.global_step % 10 == 0:
-                self._log_batch(out)
+                self._log_batch(out, grad_norm)
             self.global_step += 1
-            n += 1
 
-        return {f"train_{k}": v / n for k, v in totals.items()}
+            pbar.set_postfix({
+                "loss":   f"{loss.item():.3e}",
+                "recon":  f"{out['recon_loss'].item():.3e}",
+                "KL_θ":   f"{out['kl_theta'].item():.3e}",
+                "skip":   n_nan,
+            })
+
+        if n_nan > 0:
+            print(f"  ⚠ Epoch had {n_nan} skipped NaN/Inf batches")
+        if n_ok == 0:
+            return {f"train_{k}": float("nan") for k in totals}
+
+        return {f"train_{k}": v / n_ok for k, v in totals.items()}
 
     @torch.no_grad()
     def _validate(self) -> Dict[str, float]:
@@ -217,8 +276,8 @@ class DETMTrainer:
             bow = batch["bow"].to(self.device)
             t_idx = batch["time_idx"].to(self.device)
             out = self.model(bow, t_idx, compute_loss=True)
-            # Unscaled loss — no KL annealing / weighting during validation
-            # so the metric reflects the true ELBO components.
+            if not torch.isfinite(out["loss"]):
+                continue
             totals["recon"] += out["recon_loss"].item()
             totals["kl_theta"] += out["kl_theta"].item()
             totals["kl_eta"] += out["kl_eta"].item()
@@ -228,6 +287,8 @@ class DETMTrainer:
             ).item()
             n += 1
 
+        if n == 0:
+            return {f"val_{k}": float("nan") for k in totals}
         return {f"val_{k}": v / n for k, v in totals.items()}
 
     # ------------------------------------------------------------------
@@ -240,6 +301,8 @@ class DETMTrainer:
             "model_state_dict": self.model.state_dict(),
             "optimizer_state_dict": self.optimizer.state_dict(),
             "best_val_loss": self.best_val_loss,
+            "plateau_counter": self.plateau_counter,
+            "global_step": self.global_step,
             "history": self.history,
             "config": self.config.to_dict(),
         }
@@ -252,13 +315,14 @@ class DETMTrainer:
             torch.save(ckpt, path)
             print(f"  Best model → {path}")
 
-    def _log_batch(self, out: Dict) -> None:
+    def _log_batch(self, out: Dict, grad_norm: torch.Tensor) -> None:
         s = self.global_step
         self.writer.add_scalar("Batch/Loss", out["loss"].item(), s)
         self.writer.add_scalar("Batch/Reconstruction", out["recon_loss"].item(), s)
         self.writer.add_scalar("Batch/KL_theta", out["kl_theta"].item(), s)
         self.writer.add_scalar("Batch/KL_eta", out["kl_eta"].item(), s)
         self.writer.add_scalar("Batch/KL_alpha", out["kl_alpha"].item(), s)
+        self.writer.add_scalar("Batch/Grad_Norm", grad_norm.item(), s)
 
     def _log_epoch(
         self,
@@ -283,10 +347,17 @@ class DETMTrainer:
         ]:
             w.add_scalar(tag, val, epoch)
 
-        # Gradient norm
+        # Gradient norm (epoch-end snapshot)
         total_norm = sum(
             p.grad.data.norm(2).item() ** 2
             for p in self.model.parameters()
             if p.grad is not None
         ) ** 0.5
         w.add_scalar("Epoch/Gradient_Norm", total_norm, epoch)
+
+        # α posterior diagnostics
+        with torch.no_grad():
+            alpha_var = self.model.alpha_logvar.exp()
+            w.add_scalar("Epoch/Alpha/PosteriorVar_mean", alpha_var.mean().item(), epoch)
+            w.add_scalar("Epoch/Alpha/PosteriorVar_max", alpha_var.max().item(), epoch)
+            w.add_scalar("Epoch/Alpha/Logvar_mean", self.model.alpha_logvar.mean().item(), epoch)

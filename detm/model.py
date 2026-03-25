@@ -293,14 +293,21 @@ class ReconstructionLoss(nn.Module):
         bow: torch.Tensor,
         word_dist: torch.Tensor,
     ) -> torch.Tensor:
-        """Return batch-mean NLL scalar."""
+        """
+        Return per-document NLL vector of shape (B,).
+
+        Callers (``DETM.forward``) apply corpus-scale normalisation via
+        ``.sum() * coeff`` where ``coeff = num_train_docs / batch_size``.
+        This puts the reconstruction term on the same O(D) scale as the
+        global KL terms, matching the original DETM paper's ELBO formulation.
+        """
         if self.loss_type == "multinomial":
             nll = -(bow * torch.log(word_dist.clamp(min=1e-10))).sum(dim=-1)
         else:  # poisson
             doc_len = bow.sum(dim=-1, keepdim=True)
             rates = (word_dist * doc_len).clamp(min=1e-10)
             nll = (rates - bow * rates.log()).sum(dim=-1)
-        return nll.mean()
+        return nll  # (B,) — do NOT reduce here
 
 
 # ---------------------------------------------------------------------------
@@ -361,15 +368,20 @@ class DETM(nn.Module):
         self.alpha_mu = nn.Parameter(
             torch.randn(num_time_steps, config.NUM_TOPICS, emb_dim) * config.INIT_ALPHA_STD
         )
+        # α_logvar initialised near log(ALPHA_PRIOR_VARIANCE) + small noise.
+        # This matches the notebook and prevents the prior KL from dominating
+        # at the start of training (which happens with logvar=0 when gamma²≪1).
+        _alpha_logvar_init = math.log(config.ALPHA_PRIOR_VARIANCE)
         self.alpha_logvar = nn.Parameter(
-            torch.ones(num_time_steps, config.NUM_TOPICS, emb_dim) * config.INIT_ALPHA_LOGVAR
+            torch.ones(num_time_steps, config.NUM_TOPICS, emb_dim) * _alpha_logvar_init
+            + torch.randn(num_time_steps, config.NUM_TOPICS, emb_dim) * 0.1
         )
         self.decoder = DETMDecoder(
             num_topics=config.NUM_TOPICS,
             vocab_size=vocab_size,
             embedding_dim=emb_dim,
             word_embeddings=word_embeddings,
-            train_word_embeddings=True,
+            train_word_embeddings=config.TRAIN_WORD_EMBEDDINGS,
         )
         self.recon_loss_fn = ReconstructionLoss(loss_type="multinomial")
 
@@ -487,13 +499,25 @@ class DETM(nn.Module):
         }
 
         if compute_loss:
-            recon = self.recon_loss_fn(bow, word_dist)
+            # Corpus-scale loss normalisation:
+            #   coeff = D / B  (D = num_train_docs, B = batch size)
+            # recon and kl_theta are per-document means scaled up to corpus scale.
+            # kl_eta and kl_alpha are already global KL terms (summed over T, K, L).
+            # All four terms are then on the same ~O(D) magnitude so gradients
+            # from all components contribute proportionally.  This matches the
+            # original DETM paper's ELBO and the notebook implementation.
+            B = bow.shape[0]
+            coeff = self.num_train_docs / B
+
+            recon_per_doc = self.recon_loss_fn(bow, word_dist)   # (B,)
+            recon = recon_per_doc.sum() * coeff
 
             var_theta = theta_logvar.exp()
-            kl_theta = 0.5 * torch.sum(
+            kl_theta_per_doc = 0.5 * torch.sum(
                 (theta_mu - eta_batch).pow(2) + var_theta - theta_logvar - 1.0,
                 dim=-1,
-            ).mean()
+            )  # (B,)
+            kl_theta = kl_theta_per_doc.sum() * coeff
 
             kl_eta_n = kl_eta / self.num_train_docs
             kl_alpha_n = self._compute_alpha_kl() / self.num_train_docs
